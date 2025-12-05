@@ -24,7 +24,7 @@ Add the following to your `Package.swift` file:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/mattt/EventSource.git", from: "1.3.0")
+    .package(url: "https://github.com/eric-humane/EventSource.git", from: "2.0.0")
 ]
 ```
 
@@ -41,33 +41,22 @@ with event handlers for connection lifecycle management.
 import EventSource
 import Foundation
 
-// Initialize with SSE endpoint URL
+// Configure without connecting yet
 let sse = EventSource(url: URL(string: "https://example.com/events")!)
 
-// Set up event handlers
-sse.onOpen = {
-    print("Connection established")
-}
+// Install handlers
+sse.onOpen = { print("Connection established") }
+sse.onMessage = { event in print("Received: \(event.data)") }
+sse.onError = { error in print("Error: \(String(describing: error))") }
 
-sse.onMessage = { e in
-    print("Received event: \(e.event): \(e.data)")
-}
-
-sse.onError = { error in
-    if let error = error {
-        print("Error: \(error)")
-    } else {
-        print("Connection closed")
-    }
-}
-
-// Begin listening
+// Start listening explicitly
 Task { await sse.listen() }
 
-// Later, when done
-Task {
-    await sse.close()
-}
+// Or start immediately with the convenience initializer:
+// let sse = await EventSource(listeningTo: URL(string: "https://example.com/events")!)
+
+// Close when finished
+Task { await sse.close() }
 ```
 
 ### Processing an AsyncSequence of Server-Sent Events
