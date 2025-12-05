@@ -3,6 +3,42 @@ import Foundation
 #if canImport(FoundationNetworking)
     import FoundationNetworking
 #endif
+#if canImport(OSLog)
+    import OSLog
+#endif
+
+/// Lightweight, pluggable logging wrapper used by EventSource.
+public struct EventSourceLogHandler: Sendable {
+    public enum Level: Sendable {
+        case debug
+        case info
+        case warning
+        case error
+    }
+
+    public let handler: @Sendable (Level, String) -> Void
+
+    public init(handler: @escaping @Sendable (Level, String) -> Void) {
+        self.handler = handler
+    }
+
+    public static var disabled: Self { Self { _, _ in } }
+
+    #if canImport(OSLog)
+        public static func os(
+            _ logger: Logger = Logger(subsystem: "EventSource", category: "EventSource")
+        ) -> Self {
+            Self { level, message in
+                switch level {
+                case .debug: logger.debug("\(message, privacy: .public)")
+                case .info: logger.info("\(message, privacy: .public)")
+                case .warning: logger.warning("\(message, privacy: .public)")
+                case .error: logger.error("\(message, privacy: .public)")
+                }
+            }
+        }
+    #endif
+}
 
 /// Errors that can occur when using `EventSource`.
 public enum EventSourceError: Swift.Error, LocalizedError {
@@ -371,6 +407,15 @@ public actor EventSource {
     /// The current state of the connection (connecting, open, or closed).
     public private(set) var readyState: ReadyState = .closed
 
+    /// Handler used for logging lifecycle and diagnostic messages.
+    public var logHandler: EventSourceLogHandler = {
+        #if canImport(OSLog)
+            return .os()
+        #else
+            return .disabled
+        #endif
+    }()
+
     /// The maximum number of events to deliver when finalizing parsing.
     ///
     /// This limit prevents unbounded memory growth in edge cases where
@@ -490,16 +535,21 @@ public actor EventSource {
         configuration: URLSessionConfiguration = .default,
         onOpen: (@Sendable () async -> Void)? = nil,
         onMessage: (@Sendable (Event) async -> Void)? = nil,
-        onError: (@Sendable (Swift.Error?) async -> Void)? = nil
+        onError: (@Sendable (Swift.Error?) async -> Void)? = nil,
+        logHandler: EventSourceLogHandler? = nil
     ) {
         self.session = URLSession(configuration: configuration)
         self.request = request
         self._onOpenCallback = onOpen
         self._onMessageCallback = onMessage
         self._onErrorCallback = onError
+        if let logHandler {
+            self.logHandler = logHandler
+        }
         #if DEBUG
             if connectionTask == nil {
-                debugPrint(
+                self.logHandler.handler(
+                    .debug,
                     "EventSource initialized but not listening; call await listen() to begin receiving events."
                 )
             }
@@ -513,7 +563,8 @@ public actor EventSource {
         url: URL,
         onOpen: (@Sendable () async -> Void)? = nil,
         onMessage: (@Sendable (Event) async -> Void)? = nil,
-        onError: (@Sendable (Swift.Error?) async -> Void)? = nil
+        onError: (@Sendable (Swift.Error?) async -> Void)? = nil,
+        logHandler: EventSourceLogHandler? = nil
     ) {
         var request = URLRequest(url: url)
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -523,9 +574,13 @@ public actor EventSource {
         self._onOpenCallback = onOpen
         self._onMessageCallback = onMessage
         self._onErrorCallback = onError
+        if let logHandler {
+            self.logHandler = logHandler
+        }
         #if DEBUG
             if connectionTask == nil {
-                debugPrint(
+                self.logHandler.handler(
+                    .debug,
                     "EventSource initialized but not listening; call await listen() to begin receiving events."
                 )
             }
@@ -538,13 +593,17 @@ public actor EventSource {
         configuration: URLSessionConfiguration = .default,
         onOpen: (@Sendable () async -> Void)? = nil,
         onMessage: (@Sendable (Event) async -> Void)? = nil,
-        onError: (@Sendable (Swift.Error?) async -> Void)? = nil
+        onError: (@Sendable (Swift.Error?) async -> Void)? = nil,
+        logHandler: EventSourceLogHandler? = nil
     ) async {
         self.session = URLSession(configuration: configuration)
         self.request = request
         self._onOpenCallback = onOpen
         self._onMessageCallback = onMessage
         self._onErrorCallback = onError
+        if let logHandler {
+            self.logHandler = logHandler
+        }
         await listen()
     }
 
@@ -553,7 +612,8 @@ public actor EventSource {
         listeningTo url: URL,
         onOpen: (@Sendable () async -> Void)? = nil,
         onMessage: (@Sendable (Event) async -> Void)? = nil,
-        onError: (@Sendable (Swift.Error?) async -> Void)? = nil
+        onError: (@Sendable (Swift.Error?) async -> Void)? = nil,
+        logHandler: EventSourceLogHandler? = nil
     ) async {
         var request = URLRequest(url: url)
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -563,6 +623,9 @@ public actor EventSource {
         self._onOpenCallback = onOpen
         self._onMessageCallback = onMessage
         self._onErrorCallback = onError
+        if let logHandler {
+            self.logHandler = logHandler
+        }
         await listen()
     }
 
@@ -609,6 +672,7 @@ public actor EventSource {
 
         if droppedEvents > 0 {
             await _onErrorCallback?(EventSourceError.finalizationOverflow(dropped: droppedEvents))
+            log(.warning, "Dropped \(droppedEvents) events during finalization (max \(maximumFinalizationEventCount)).")
         }
 
         return droppedEvents
@@ -742,6 +806,10 @@ public actor EventSource {
 
         // Update state to `.closed`.
         readyState = .closed
+    }
+
+    private func log(_ level: EventSourceLogHandler.Level, _ message: @autoclosure () -> String) {
+        logHandler.handler(level, message())
     }
 }
 
