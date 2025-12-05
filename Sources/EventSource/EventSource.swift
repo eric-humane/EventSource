@@ -429,13 +429,16 @@ public actor EventSource {
 
     /// Sets the maximum number of events to deliver during finalization.
     public func setMaximumFinalizationEventCount(_ value: Int) {
-        maximumFinalizationEventCount = max(0, value)
+        maximumFinalizationEventCount = Swift.max(0, value)
     }
 
     // Backing storage for callbacks
     private var _onOpenCallback: (@Sendable () async -> Void)?
     private var _onMessageCallback: (@Sendable (Event) async -> Void)?
     private var _onErrorCallback: (@Sendable (Swift.Error?) async -> Void)?
+
+    // AsyncSequence support
+    private var streamContinuations: [UUID: AsyncStream<Event>.Continuation] = [:]
 
     #if canImport(FoundationNetworking)
         // Linux-specific streaming support
@@ -500,7 +503,7 @@ public actor EventSource {
         }
 
         fileprivate func deliver(_ event: Event) async {
-            await _onMessageCallback?(event)
+            await deliverEvent(event)
         }
 
         fileprivate func emitError(_ error: Error?) async {
@@ -512,6 +515,7 @@ public actor EventSource {
             readyState = .closed
             linuxTask?.cancel()
             linuxSession?.invalidateAndCancel()
+            finishStreams()
             await resumeLinuxCompletion()
         }
 
@@ -649,6 +653,7 @@ public actor EventSource {
         readyState = .closed
         connectionTask?.cancel()
         connectionTask = nil
+        finishStreams()
         #if canImport(FoundationNetworking)
             linuxTask?.cancel()
             linuxSession?.invalidateAndCancel()
@@ -662,7 +667,7 @@ public actor EventSource {
         let maxEvents = maximumFinalizationEventCount
         while let event = await parser.getNextEvent(), eventsDelivered < maxEvents {
             eventsDelivered += 1
-            await _onMessageCallback?(event)
+            await deliverEvent(event)
         }
 
         var droppedEvents = 0
@@ -763,9 +768,7 @@ public actor EventSource {
                         await parser.consume(byte)
 
                         while let event = await parser.getNextEvent() {
-                            if let onMessage = _onMessageCallback {
-                                await onMessage(event)
-                            }
+                            await deliverEvent(event)
                         }
                     }
                 #endif
@@ -806,6 +809,45 @@ public actor EventSource {
 
         // Update state to `.closed`.
         readyState = .closed
+        finishStreams()
+    }
+
+    private func deliverEvent(_ event: Event) async {
+        if let onMessage = _onMessageCallback {
+            await onMessage(event)
+        }
+        yieldToStreams(event)
+    }
+
+    private func registerStreamContinuation(
+        _ continuation: AsyncStream<Event>.Continuation,
+        id: UUID
+    ) async {
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeStreamContinuation(id) }
+        }
+        streamContinuations[id] = continuation
+        if connectionTask == nil {
+            await listen()
+        }
+    }
+
+    private func removeStreamContinuation(_ id: UUID) {
+        streamContinuations.removeValue(forKey: id)
+    }
+
+    private func yieldToStreams(_ event: Event) {
+        for continuation in streamContinuations.values {
+            continuation.yield(event)
+        }
+    }
+
+    private func finishStreams() {
+        guard !streamContinuations.isEmpty else { return }
+        for continuation in streamContinuations.values {
+            continuation.finish()
+        }
+        streamContinuations.removeAll()
     }
 
     private func log(_ level: EventSourceLogHandler.Level, _ message: @autoclosure () -> String) {
@@ -815,3 +857,24 @@ public actor EventSource {
 
 /// A type alias for `EventSource.Event`.
 public typealias SSE = EventSource.Event
+
+extension EventSource: AsyncSequence {
+    public typealias Element = Event
+
+    public struct AsyncIterator: AsyncIteratorProtocol {
+        var iterator: AsyncStream<Event>.Iterator
+
+        public mutating func next() async -> Event? {
+            return await iterator.next()
+        }
+    }
+
+    public nonisolated func makeAsyncIterator() -> AsyncIterator {
+        let stream = AsyncStream<Event> { continuation in
+            let id = UUID()
+            Task { await self.registerStreamContinuation(continuation, id: id) }
+        }
+
+        return AsyncIterator(iterator: stream.makeAsyncIterator())
+    }
+}

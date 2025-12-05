@@ -387,6 +387,47 @@ import Testing
                 // Clean up
                 await eventSource.close()
             }
+
+            @Test("Iterate EventSource as AsyncSequence", .mockURLSession)
+            func asyncSequenceIteration() async throws {
+                let url = URL(string: "https://example.com/events")!
+                let responseData = "data: first\n\ndata: second\n\n"
+
+                await MockURLProtocol.setHandler { request in
+                    #expect(request.url == url)
+
+                    let response = HTTPURLResponse(
+                        url: url,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": "text/event-stream"]
+                    )!
+
+                    return (response, Data(responseData.utf8))
+                }
+
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [MockURLProtocol.self]
+
+                var request = URLRequest(url: url)
+                request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+                let eventSource = EventSource(
+                    request: request,
+                    configuration: configuration
+                )
+
+                var received: [String] = []
+
+                for await event in eventSource {
+                    received.append(event.data)
+                    if received.count == 2 {
+                        await eventSource.close()
+                    }
+                }
+
+                #expect(received == ["first", "second"])
+            }
         }
 
         #if !canImport(FoundationNetworking)
