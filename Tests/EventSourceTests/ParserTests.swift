@@ -1,4 +1,5 @@
-import EventSource
+import Foundation
+@testable import EventSource
 import Testing
 
 @Suite("EventSource Parser Tests", .timeLimit(.minutes(1)))
@@ -51,6 +52,43 @@ struct ParserTests {
         let events = await getEvents(from: stream)
         #expect(events.count == 1)
         #expect(events.first?.data == "line1\nline2")
+    }
+
+    @Test("Events require data to dispatch")
+    func eventsRequireData() async {
+        let parser = EventSource.Parser()
+        let stream = "id: 42\n\n"
+        let events = await getEvents(from: stream, parser: parser)
+
+        #expect(events.isEmpty, "Events without data lines should not be dispatched per spec.")
+        #expect(await parser.getLastEventId() == "42")
+    }
+
+    @Test("Events inherit last ID when no new ID is provided")
+    func eventsInheritLastEventID() async {
+        let stream = "id: 123\ndata: first\n\ndata: second\n\n"
+        let events = await getEvents(from: stream)
+        #expect(events.count == 2)
+        #expect(events[0].id == "123")
+        #expect(events[1].id == "123")
+    }
+
+    @Test("BOM is stripped only on the first line")
+    func bomOnlyStrippedOnFirstLine() async {
+        let bom = "\u{FEFF}"
+        let stream = "\(bom)data: first\n\ndata: \(bom)second\n\n"
+        let events = await getEvents(from: stream)
+        #expect(events.count == 2)
+        #expect(events[0].data == "first")
+        #expect(events[1].data == "\(bom)second")
+    }
+
+    @Test("Incomplete event at EOF is discarded")
+    func incompleteEventDiscardedAtEOF() async {
+        // Missing trailing blank line should discard the buffered event
+        let stream = "data: orphaned event\n"
+        let events = await getEvents(from: stream)
+        #expect(events.isEmpty)
     }
 
     @Suite("Event Field Tests")
@@ -445,7 +483,10 @@ struct ParserTests {
                 :comment before data
                 data: hello
 
-                """.utf8
+                """
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .appending("\n\n")
+                .utf8
 
             for byte in bytes {
                 await parser.consume(byte)
@@ -466,24 +507,16 @@ struct ParserTests {
             #expect(event3 == nil)
         }
 
-        @Test("Final line unterminated is processed by finish")
-        func finalLineUnterminatedIsProcessedByCurrentFinishLogic() async {
-            // This test reflects the current behavior of Parser.finish().
-            // As noted, the SSE spec suggests an unterminated final block without a blank line should be discarded.
-            // Your parser's finish() method currently dispatches such events.
+        @Test("Final line unterminated is discarded at EOF per spec")
+        func finalLineUnterminatedIsDiscarded() async {
+            // No trailing blank line means the pending event must be discarded (spec §9.2.6).
             let stream = "data: final event"  // No trailing newline or blank line
             let events = await getEvents(from: stream)
-            #expect(
-                events.count == 1,
-                "Event should be dispatched based on current finish() logic."
-            )
-            #expect(events.first?.data == "final event")
+            #expect(events.isEmpty)
 
             let streamWithID = "id: lastid\ndata: final event with id"
             let events2 = await getEvents(from: streamWithID)
-            #expect(events2.count == 1)
-            #expect(events2.first?.id == "lastid")
-            #expect(events2.first?.data == "final event with id")
+            #expect(events2.isEmpty)
         }
 
         @Test("Empty comment")
@@ -575,11 +608,7 @@ struct ParserTests {
 
         @Test("Retry with data")
         func retryWithData() async throws {
-            let sseData = """
-                retry: 1000
-                data: hello
-
-                """
+            let sseData = "retry: 1000\ndata: hello\n\n"
 
             var iterator = AsyncBytes(sseData.utf8).events.makeAsyncIterator()
             let event = try await iterator.next()
@@ -645,6 +674,73 @@ struct ParserTests {
             await parser.finish()
             #expect(await parser.getReconnectionTime() == 5000)
         }
+    }
+}
+
+@Suite("Finalization Limits")
+struct FinalizationLimitTests {
+    actor FinalizationTracker {
+        private var events: [EventSource.Event] = []
+        private var errors: [Swift.Error] = []
+
+        func addEvent(_ event: EventSource.Event) {
+            events.append(event)
+        }
+
+        func addError(_ error: Swift.Error?) {
+            if let error { errors.append(error) }
+        }
+
+        func getEvents() -> [EventSource.Event] {
+            events
+        }
+
+        func getErrors() -> [Swift.Error] {
+            errors
+        }
+    }
+
+    @Test("Reports overflow when finalization drops events")
+    func reportsOverflow() async {
+        let parser = EventSource.Parser()
+        let stream = "data: one\n\ndata: two\n\ndata: three\n\n"
+        for byte in stream.utf8 {
+            await parser.consume(byte)
+        }
+        await parser.finish()
+
+        let tracker = FinalizationTracker()
+        let url = URL(string: "https://example.com/events")!
+        let source = EventSource(
+            request: URLRequest(url: url),
+            configuration: .ephemeral,
+            onOpen: nil,
+            onMessage: { event in
+                await tracker.addEvent(event)
+            },
+            onError: { error in
+                await tracker.addError(error)
+            }
+        )
+        await source.setMaximumFinalizationEventCount(1)
+
+        let dropped = await source.deliverFinalEvents(from: parser)
+
+        let events = await tracker.getEvents()
+        #expect(events.count == 1)
+        #expect(events.first?.data == "one")
+
+        #expect(dropped >= 1)
+
+        let errors = await tracker.getErrors()
+        var sawOverflow = false
+        for error in errors {
+            if case let EventSourceError.finalizationOverflow(droppedCount) = error {
+                sawOverflow = true
+                #expect(droppedCount == dropped)
+            }
+        }
+        #expect(sawOverflow, "Should surface finalization overflow via onError")
     }
 }
 

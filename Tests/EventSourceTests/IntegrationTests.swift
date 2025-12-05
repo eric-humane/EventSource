@@ -61,6 +61,8 @@ import Testing
                     data: {"text":"!","isComplete":true}
 
                     """
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    + "\n\n"
 
                 actor HandlerCallTracker {
                     private var callCount = 0
@@ -112,7 +114,10 @@ import Testing
                 let responseState = ResponseState()
 
                 // Create the EventSource with the custom configuration
-                let eventSource = EventSource(request: request, configuration: configuration)
+                let eventSource = EventSource(
+                    request: request,
+                    configuration: configuration
+                )
 
                 // Set up event handler
                 eventSource.onMessage = { event in
@@ -137,6 +142,8 @@ import Testing
                         await eventSource.close()
                     }
                 }
+
+                await eventSource.listen()
 
                 // Wait for completion or timeout
                 try await Task.sleep(for: .seconds(2))
@@ -235,12 +242,6 @@ import Testing
                 request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                 request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
 
-                // Create the EventSource with the custom configuration
-                let eventSource = EventSource(request: request, configuration: configuration)
-
-                // Give the connection task a chance to start
-                await Task.yield()
-
                 // Track received events
                 actor EventTracker {
                     var events: [EventSource.Event] = []
@@ -278,24 +279,20 @@ import Testing
 
                 let tracker = EventTracker()
 
-                // Set up the event handlers
-                eventSource.onOpen = {
-                    Task {
+                // Create the EventSource with handlers pre-installed
+                let eventSource = await EventSource(
+                    listeningTo: request,
+                    configuration: configuration,
+                    onOpen: {
                         await tracker.incrementOpenCount()
-                    }
-                }
-
-                eventSource.onMessage = { event in
-                    Task {
+                    },
+                    onMessage: { event in
                         await tracker.addEvent(event)
-                    }
-                }
-
-                eventSource.onError = { _ in
-                    Task {
+                    },
+                    onError: { _ in
                         await tracker.incrementErrorCount()
                     }
-                }
+                )
 
                 // Wait for a bit to allow for connection, error, and reconnection
                 try await Task.sleep(for: .milliseconds(500))
@@ -361,21 +358,17 @@ import Testing
                 var request = URLRequest(url: url)
                 request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-                // Create EventSource with the custom session
-                let eventSource = EventSource(
-                    request: request,
-                    configuration: configuration
-                )
-
-                // Set up error handler
                 let errorTracker = ErrorTracker()
-                eventSource.onError = { error in
-                    if let specificError = error as? EventSourceError {
-                        Task {
+                // Create EventSource with the custom session and error handler
+                let eventSource = await EventSource(
+                    listeningTo: request,
+                    configuration: configuration,
+                    onError: { error in
+                        if let specificError = error as? EventSourceError {
                             await errorTracker.setError(specificError)
                         }
                     }
-                }
+                )
 
                 // Wait for the error
                 try await Task.sleep(for: .milliseconds(100))
@@ -420,6 +413,8 @@ import Testing
                         data: {"text":"!","isComplete":true}
 
                         """
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        + "\n\n"
 
                     await MockURLProtocol.setHandler { request in
                         #expect(request.url == url)
@@ -501,6 +496,8 @@ import Testing
                         data: {"text":"!","isComplete":true}
 
                         """
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        + "\n\n"
 
                     await MockURLProtocol.setHandler { request in
                         #expect(request.url == url)
@@ -572,12 +569,7 @@ import Testing
                 @Test("Parse SSE events from byte stream", .mockURLSession)
                 func parseSSEEvents() async throws {
                     let url = URL(string: "https://example.com/events")!
-                    let sseData = """
-                        data: event1
-
-                        data: event2
-
-                        """
+                    let sseData = "data: event1\n\ndata: event2\n\n"
 
                     await MockURLProtocol.setHandler { request in
                         #expect(request.url == url)
@@ -630,6 +622,8 @@ import Testing
                         data: {"status":"done"}
 
                         """
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        + "\n\n"
 
                     await MockURLProtocol.setHandler { request in
                         #expect(request.url == url)
@@ -756,6 +750,8 @@ import Testing
                             data: {"text":"world!","isComplete":true}
 
                             """
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            + "\n\n"
 
                         let response = HTTPURLResponse(
                             url: url,

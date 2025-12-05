@@ -44,9 +44,6 @@ import Foundation
 // Initialize with SSE endpoint URL
 let sse = EventSource(url: URL(string: "https://example.com/events")!)
 
-// Create an EventSource with the URL
-let sse = EventSource(url: url)
-
 // Set up event handlers
 sse.onOpen = {
     print("Connection established")
@@ -63,6 +60,9 @@ sse.onError = { error in
         print("Connection closed")
     }
 }
+
+// Begin listening
+Task { await sse.listen() }
 
 // Later, when done
 Task {

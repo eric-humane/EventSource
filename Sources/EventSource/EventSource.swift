@@ -12,6 +12,9 @@ public enum EventSourceError: Swift.Error, LocalizedError {
     /// The Content-Type header is not `text/event-stream`.
     case invalidContentType(String?)
 
+    /// The parser produced more events during finalization than the configured limit allows; extras were dropped.
+    case finalizationOverflow(dropped: Int)
+
     public var errorDescription: String {
         switch self {
         case .invalidHTTPStatus(let code):
@@ -22,6 +25,8 @@ public enum EventSourceError: Swift.Error, LocalizedError {
             } else {
                 return "Missing Content-Type header in SSE response"
             }
+        case .finalizationOverflow(let dropped):
+            return "Dropped \(dropped) events while finalizing the stream (exceeded maximumFinalizationEventCount)"
         }
     }
 }
@@ -166,6 +171,9 @@ public actor EventSource {
         private var lineBuffer: [UInt8] = []
         private var sawCR = false
 
+        /// Whether BOM stripping is still allowed (only on the first line).
+        private var shouldStripInitialBOM = true
+
         // Event queue
         private var eventQueue: [Event] = []
 
@@ -203,14 +211,22 @@ public actor EventSource {
             }
         }
 
-        /// Convert the line buffer to a string and clear it
+        /// Convert the line buffer to a string and clear it.
+        ///
+        /// The UTF-8 decode algorithm strips at most one leading BOM; we mirror that
+        /// by only stripping on the first processed line (HTML spec §9.2.6).
         private func processLineBuffer() -> String {
-            // Skip UTF-8 BOM if present at the start of the buffer
-            if lineBuffer.count >= 3,
+            // Skip UTF-8 BOM if present on the first line only
+            if shouldStripInitialBOM,
+                lineBuffer.count >= 3,
                 lineBuffer.prefix(3) == [0xEF, 0xBB, 0xBF]
             {
                 lineBuffer.removeFirst(3)
+                shouldStripInitialBOM = false
             }
+
+            // Only the first processed line should ever strip a BOM
+            shouldStripInitialBOM = false
 
             // Use String(decoding:as:) to handle invalid UTF-8 sequences by replacing them with replacement character
             let line = String(decoding: lineBuffer, as: UTF8.self)
@@ -276,10 +292,9 @@ public actor EventSource {
 
         /// Create an event from the current state and add it to the queue
         private func dispatchEvent() {
-            let isDataField = currentData.isEmpty && seenFields.contains("data")
-            let isRetryOnly =
-                currentData.isEmpty && currentEventId == nil && currentEventType == nil
-                && !isDataField
+            let hasExplicitDataField = seenFields.contains("data")
+            let hasDispatchableData = hasExplicitDataField || !currentData.isEmpty
+            let eventId = currentEventId ?? (lastEventId.isEmpty ? nil : lastEventId)
 
             // Reset the event state for the next event
             defer {
@@ -289,13 +304,13 @@ public actor EventSource {
                 currentRetry = nil
             }
 
-            guard !isRetryOnly else {
+            guard hasDispatchableData else {
                 return
             }
 
             // Dispatch events only if they have data or other fields
             let event = Event(
-                id: currentEventId,
+                id: eventId,
                 event: currentEventType,
                 data: currentData,
                 retry: currentRetry
@@ -332,10 +347,12 @@ public actor EventSource {
                 handleLine(line)
             }
 
-            // Send an empty line to trigger event dispatch
-            if !currentData.isEmpty || currentEventId != nil || currentEventType != nil {
-                handleLine("")
-            }
+            // Per SSE spec, pending data at EOF without a trailing blank line is discarded.
+            currentEventType = nil
+            currentData = ""
+            currentEventId = nil
+            currentRetry = nil
+            seenFields.removeAll()
         }
     }
 
@@ -352,7 +369,7 @@ public actor EventSource {
     private var connectionTask: Task<Void, Never>?
 
     /// The current state of the connection (connecting, open, or closed).
-    public private(set) var readyState: ReadyState = .connecting
+    public private(set) var readyState: ReadyState = .closed
 
     /// The maximum number of events to deliver when finalizing parsing.
     ///
@@ -364,6 +381,11 @@ public actor EventSource {
     /// Increase this value if your application needs to buffer more events
     /// during connection finalization.
     public var maximumFinalizationEventCount: Int = 100
+
+    /// Sets the maximum number of events to deliver during finalization.
+    public func setMaximumFinalizationEventCount(_ value: Int) {
+        maximumFinalizationEventCount = max(0, value)
+    }
 
     // Backing storage for callbacks
     private var _onOpenCallback: (@Sendable () async -> Void)?
@@ -460,40 +482,102 @@ public actor EventSource {
         }
     #endif
 
-    /// Initializes a new EventSource and begins connecting to the given URL.
+    /// Initializes a new EventSource without starting the connection.
     ///
-    /// - Parameter url: The URL to open the SSE connection to.
-    public init(url: URL) {
-        var request = URLRequest(url: url)
-        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        self.init(request: request)
-    }
-
-    /// Initializes a new EventSource with a custom URL request and configuration,
-    /// and begins connecting.
-    ///
-    /// - Parameters:
-    ///   - request: The URLRequest to use for the SSE connection.
-    ///              The request must have "Accept" and "Cache-Control" headers set appropriately,
-    ///              and must point to an SSE endpoint.
-    ///   - configuration: The URLSessionConfiguration to use for the SSE connection.
-    ///                    Defaults to `.default`.
+    /// Call `await listen()` to begin streaming after installing callbacks.
     public init(
         request: URLRequest,
-        configuration: URLSessionConfiguration = .default
+        configuration: URLSessionConfiguration = .default,
+        onOpen: (@Sendable () async -> Void)? = nil,
+        onMessage: (@Sendable (Event) async -> Void)? = nil,
+        onError: (@Sendable (Swift.Error?) async -> Void)? = nil
     ) {
         self.session = URLSession(configuration: configuration)
         self.request = request
-        Task { [weak self] in
-            await self?.open()
-        }
+        self._onOpenCallback = onOpen
+        self._onMessageCallback = onMessage
+        self._onErrorCallback = onError
+        #if DEBUG
+            if connectionTask == nil {
+                debugPrint(
+                    "EventSource initialized but not listening; call await listen() to begin receiving events."
+                )
+            }
+        #endif
+    }
+
+    /// Initializes a new EventSource with a URL without starting the connection.
+    ///
+    /// Call `await listen()` to begin streaming after installing callbacks.
+    public init(
+        url: URL,
+        onOpen: (@Sendable () async -> Void)? = nil,
+        onMessage: (@Sendable (Event) async -> Void)? = nil,
+        onError: (@Sendable (Swift.Error?) async -> Void)? = nil
+    ) {
+        var request = URLRequest(url: url)
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        self.session = URLSession(configuration: .default)
+        self.request = request
+        self._onOpenCallback = onOpen
+        self._onMessageCallback = onMessage
+        self._onErrorCallback = onError
+        #if DEBUG
+            if connectionTask == nil {
+                debugPrint(
+                    "EventSource initialized but not listening; call await listen() to begin receiving events."
+                )
+            }
+        #endif
+    }
+
+    /// Initializes and immediately begins listening to the given URLRequest.
+    public init(
+        listeningTo request: URLRequest,
+        configuration: URLSessionConfiguration = .default,
+        onOpen: (@Sendable () async -> Void)? = nil,
+        onMessage: (@Sendable (Event) async -> Void)? = nil,
+        onError: (@Sendable (Swift.Error?) async -> Void)? = nil
+    ) async {
+        self.session = URLSession(configuration: configuration)
+        self.request = request
+        self._onOpenCallback = onOpen
+        self._onMessageCallback = onMessage
+        self._onErrorCallback = onError
+        await listen()
+    }
+
+    /// Initializes and immediately begins listening to the given URL.
+    public init(
+        listeningTo url: URL,
+        onOpen: (@Sendable () async -> Void)? = nil,
+        onMessage: (@Sendable (Event) async -> Void)? = nil,
+        onError: (@Sendable (Swift.Error?) async -> Void)? = nil
+    ) async {
+        var request = URLRequest(url: url)
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        self.session = URLSession(configuration: .default)
+        self.request = request
+        self._onOpenCallback = onOpen
+        self._onMessageCallback = onMessage
+        self._onErrorCallback = onError
+        await listen()
     }
 
     private func open() {
+        guard connectionTask == nil else { return }
         self.connectionTask = Task.detached { [weak self] in
             await self?.connect()
         }
+    }
+
+    /// Begins listening to the SSE stream.
+    public func listen() async {
+        guard connectionTask == nil else { return }
+        readyState = .connecting
+        open()
     }
 
     /// Closes the SSE connection and prevents any further reconnection attempts.
@@ -506,6 +590,28 @@ public actor EventSource {
             linuxTask?.cancel()
             linuxSession?.invalidateAndCancel()
         #endif
+    }
+
+    /// Continuously handles connecting and reconnecting to the SSE stream.
+    @discardableResult
+    func deliverFinalEvents(from parser: Parser) async -> Int {
+        var eventsDelivered = 0
+        let maxEvents = maximumFinalizationEventCount
+        while let event = await parser.getNextEvent(), eventsDelivered < maxEvents {
+            eventsDelivered += 1
+            await _onMessageCallback?(event)
+        }
+
+        var droppedEvents = 0
+        while await parser.getNextEvent() != nil {
+            droppedEvents += 1
+        }
+
+        if droppedEvents > 0 {
+            await _onErrorCallback?(EventSourceError.finalizationOverflow(dropped: droppedEvents))
+        }
+
+        return droppedEvents
     }
 
     /// Continuously handles connecting and reconnecting to the SSE stream.
@@ -603,13 +709,7 @@ public actor EventSource {
                 // End of stream reached (server closed connection).
                 await parser.finish()  // finalize parsing, delivers any pending events to queue
 
-                // Deliver any events that were queued during finish()
-                var eventsDelivered = 0
-                let maxEvents = maximumFinalizationEventCount
-                while let event = await parser.getNextEvent(), eventsDelivered < maxEvents {
-                    eventsDelivered += 1
-                    await _onMessageCallback?(event)
-                }
+                _ = await deliverFinalEvents(from: parser)
 
                 // If not cancelled and still open, treat as a disconnection to reconnect.
                 if !Task.isCancelled && readyState != .closed {

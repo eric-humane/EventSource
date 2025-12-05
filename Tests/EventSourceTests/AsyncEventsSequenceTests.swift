@@ -30,12 +30,7 @@ struct AsyncEventsSequenceTests {
     @Test("Multiple events parsing")
     func multipleEventsParsing() async throws {
         // Create a string with multiple SSE events
-        let sseData = """
-            data: event1
-
-            data: event2
-
-            """
+        let sseData = "data: event1\n\ndata: event2\n\n"
 
         // Convert to async sequence of bytes
         let byteSequence = AsyncBytes(sseData.utf8)
@@ -56,13 +51,7 @@ struct AsyncEventsSequenceTests {
 
     @Test("Event with all fields")
     func eventWithAllFields() async throws {
-        let sseData = """
-            id: 123
-            event: test
-            data: hello
-            retry: 5000
-
-            """
+        let sseData = "id: 123\nevent: test\ndata: hello\nretry: 5000\n\n"
 
         var iterator = AsyncBytes(sseData.utf8).events.makeAsyncIterator()
         let event = try await iterator.next()
@@ -109,12 +98,7 @@ struct AsyncEventsSequenceTests {
     struct CommentTests {
         @Test("Comments in event stream")
         func comments() async throws {
-            let sseData = """
-                :comment line
-                data: hello
-                :another comment
-
-                """
+            let sseData = ":comment line\ndata: hello\n:another comment\n\n"
 
             var iterator = AsyncBytes(sseData.utf8).events.makeAsyncIterator()
             let event = try await iterator.next()
@@ -125,11 +109,7 @@ struct AsyncEventsSequenceTests {
 
         @Test("Only comments")
         func onlyComments() async throws {
-            let sseData = """
-                :comment line 1
-                :comment line 2
-
-                """
+            let sseData = ":comment line 1\n:comment line 2\n\n"
 
             var iterator = AsyncBytes(sseData.utf8).events.makeAsyncIterator()
             let event = try await iterator.next()
@@ -141,12 +121,7 @@ struct AsyncEventsSequenceTests {
     struct MultilineDataTests {
         @Test("Multiple data lines")
         func multipleDataLines() async throws {
-            let sseData = """
-                data: line1
-                data: line2
-                data: line3
-
-                """
+            let sseData = "data: line1\ndata: line2\ndata: line3\n\n"
 
             var iterator = AsyncBytes(sseData.utf8).events.makeAsyncIterator()
             let event = try await iterator.next()
@@ -185,11 +160,7 @@ struct AsyncEventsSequenceTests {
 
         @Test("Retry with data")
         func retryWithData() async throws {
-            let sseData = """
-                retry: 1000
-                data: hello
-
-                """
+            let sseData = "retry: 1000\ndata: hello\n\n"
 
             var iterator = AsyncBytes(sseData.utf8).events.makeAsyncIterator()
             let event = try await iterator.next()
